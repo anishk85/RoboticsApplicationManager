@@ -226,7 +226,7 @@ class Manager:
         self.world_type = None
         self.robot_launcher = None
         self.tools_launcher = None
-        self.application_process = None
+        self.application_processes = {}
         self.running = True
         self.linter = Lint()
 
@@ -722,6 +722,14 @@ class Manager:
         except Exception as e:
             LogManager.logger.exception(f"Error refreshing GTK applications: {e}")
 
+    def _kill_all_applications(self):
+        for name, proc in self.application_processes.items():
+            try:
+                stop_process_and_children(proc)
+            except Exception:
+                pass
+        self.application_processes = {}
+
     def on_run_application(self, event):
         """
         Handle the 'run_application' event.
@@ -734,28 +742,25 @@ class Manager:
             event: The event object containing application configuration and code data.
         """
         # Kill already running code
-        try:
-            proc = psutil.Process(self.application_process.pid)
-            proc.suspend()
-            proc.kill()
-        except Exception:
-            pass
+        self._kill_all_applications()
 
         # Delete old files
         if os.path.exists("/workspace/code"):
             shutil.rmtree("/workspace/code", ignore_errors=False)
         os.mkdir("/workspace/code")
 
-        # Extract app config
         app_cfg = event.kwargs.get("data", {})
         entrypoint = app_cfg["entrypoint"]
         to_lint = app_cfg["linter"]
 
-        # Unzip the app
+        # the code comes as a base64 data-uri from the browser, strip the header part
         if app_cfg["code"].startswith("data:"):
             _, _, code = app_cfg["code"].partition("base64,")
         with open("/workspace/code/app.zip", "wb") as result:
             result.write(base64.b64decode(code))
+
+        # just extract evrything to /workspace/code — if theres a processB/ folder
+        # inside the zip it'll end up at /workspace/code/processB/ on its own
         zip_ref = zipfile.ZipFile("/workspace/code/app.zip", "r")
         zip_ref.extractall("/workspace/code")
         zip_ref.close()
@@ -786,9 +791,8 @@ class Manager:
             if returncode != 0:
                 raise Exception("Failed to compile")
 
-            self.unpause_sim()
             if entrypoint.endswith(".launch.py"):
-                self.application_process = subprocess.Popen(
+                proc = subprocess.Popen(
                     [
                         f"source /workspace/code/install/setup.bash && ros2 launch {entrypoint}"
                     ],
@@ -801,8 +805,7 @@ class Manager:
                     executable="/bin/bash",
                 )
             else:
-
-                self.application_process = subprocess.Popen(
+                proc = subprocess.Popen(
                     [
                         "source /workspace/code/install/setup.bash && ros2 run academy academyCode"
                     ],
@@ -814,6 +817,8 @@ class Manager:
                     shell=True,
                     executable="/bin/bash",
                 )
+            self.application_processes["agentA"] = proc
+            self.unpause_sim()
             return
 
         # Pass the linter
@@ -831,8 +836,7 @@ class Manager:
         fds = os.listdir("/dev/pts/")
         console_fd = str(max(map(int, fds[:-1])))
 
-        self.unpause_sim()
-        self.application_process = subprocess.Popen(
+        proc = subprocess.Popen(
             ["python3", entrypoint],
             stdin=open("/dev/pts/" + console_fd, "r"),
             stdout=open("/dev/pts/" + console_fd, "w"),
@@ -840,6 +844,40 @@ class Manager:
             bufsize=1024,
             universal_newlines=True,
         )
+        self.application_processes["agentA"] = proc
+
+        # check if theres a second agent in processB/ subdir — this one is
+        # pre-programmed from the server side so no need to lint it
+        processb_entrypoint = os.path.join(
+            "/workspace/code/processB", os.path.basename(entrypoint)
+        )
+        if os.path.isfile(processb_entrypoint):
+            proc_b = subprocess.Popen(
+                ["python3", processb_entrypoint],
+                stdin=open("/dev/pts/" + console_fd, "r"),
+                stdout=open("/dev/pts/" + console_fd, "w"),
+                stderr=sys.stdout,
+                bufsize=1024,
+                universal_newlines=True,
+            )
+            self.application_processes["agentB"] = proc_b
+
+        # SIGSTOP all the procs first, then unpause gazebo, then SIGCONT them togther.
+        # using finally so even if unpause fails we dont leave frozen processes behind
+        for p in self.application_processes.values():
+            try:
+                os.kill(p.pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+
+        try:
+            self.unpause_sim()
+        finally:
+            for p in self.application_processes.values():
+                try:
+                    os.kill(p.pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
 
         LogManager.logger.info("Run application transition finished")
 
@@ -853,10 +891,9 @@ class Manager:
         Parameters:
             event: The event object associated with the termination request.
         """
-        if self.application_process:
+        if self.application_processes:
             try:
-                stop_process_and_children(self.application_process)
-                self.application_process = None
+                self._kill_all_applications()
                 self.pause_sim()
                 self.reset_sim()
             except Exception:
@@ -894,10 +931,9 @@ class Manager:
         terminates launchers, and restarts the script.
         """
 
-        if self.application_process:
+        if self.application_processes:
             try:
-                stop_process_and_children(self.application_process)
-                self.application_process = None
+                self._kill_all_applications()
             except Exception as e:
                 LogManager.logger.exception("Exception stopping application process")
 
@@ -929,13 +965,17 @@ class Manager:
         self.consumer.send_message(message.response(response))
 
     def on_pause(self, msg):
-        if self.application_process is not None:
-            proc = psutil.Process(self.application_process.pid)
-            children = proc.children(recursive=True)
-            children.append(proc)
-            for p in children:
+        if self.application_processes:
+            for proc in self.application_processes.values():
                 try:
-                    p.suspend()
+                    p = psutil.Process(proc.pid)
+                    children = p.children(recursive=True)
+                    children.append(p)
+                    for child in children:
+                        try:
+                            child.suspend()
+                        except psutil.NoSuchProcess:
+                            pass
                 except psutil.NoSuchProcess:
                     pass
             self.pause_sim()
@@ -953,13 +993,17 @@ class Manager:
         Parameters:
             msg: The event or message triggering the resume action.
         """
-        if self.application_process is not None:
-            proc = psutil.Process(self.application_process.pid)
-            children = proc.children(recursive=True)
-            children.append(proc)
-            for p in children:
+        if self.application_processes:
+            for proc in self.application_processes.values():
                 try:
-                    p.resume()
+                    p = psutil.Process(proc.pid)
+                    children = p.children(recursive=True)
+                    children.append(p)
+                    for child in children:
+                        try:
+                            child.resume()
+                        except psutil.NoSuchProcess:
+                            pass
                 except psutil.NoSuchProcess:
                     pass
             self.unpause_sim()
@@ -1028,10 +1072,9 @@ class Manager:
             except Exception as e:
                 LogManager.logger.exception("Exception stopping consumer")
 
-            if self.application_process:
+            if self.application_processes:
                 try:
-                    stop_process_and_children(self.application_process)
-                    self.application_process = None
+                    self._kill_all_applications()
                 except Exception as e:
                     LogManager.logger.exception(
                         "Exception stopping application process"
